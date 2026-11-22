@@ -42,11 +42,24 @@
   #gui .row.inline span { flex: 1; }
   #status, #engineInfo { margin-top: 6px; color: #888; font-size: 11px; }
   #help { margin-top: 8px; color: #666; font-size: 11px; }
+  #loader {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    min-width: 220px; padding: 7px 12px 9px; border-radius: 8px;
+    background: rgba(20,20,20,.82); border: 1px solid #333; backdrop-filter: blur(6px);
+    font: 11px ui-monospace, Menlo, monospace; color: #ccc; text-align: center;
+    pointer-events: none; transition: opacity .8s ease;
+  }
+  #loader.done { opacity: 0; }
+  #loader .bar { margin-top: 5px; height: 3px; background: #333; border-radius: 2px; overflow: hidden; }
+  #loader .fill { height: 100%; width: 0; background: #8cf; transition: width .2s linear; }
+  #loader.indeterminate .fill { width: 30%; animation: slide 1.1s ease-in-out infinite alternate; }
+  @keyframes slide { from { margin-left: 0; } to { margin-left: 70%; } }
   .hiddenInput { display: none; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="loader" class="done indeterminate"><div id="loaderText">loading…</div><div class="bar"><div class="fill" id="loaderFill"></div></div></div>
 
 <div id="gui">
   <h1 id="guiBar" title="click or press g to minimize / maximize"><span class="arrow">▾</span><span class="title">ZEITRAUMLUPE</span><span id="fps"></span></h1>
@@ -67,13 +80,14 @@
 
   <label for="startMode">New section starts at</label>
   <select id="startMode">
-    <option value="ahead" selected>ahead of latest section</option>
+    <option value="behind" selected>behind latest section (past)</option>
+    <option value="ahead">ahead of latest section (future)</option>
     <option value="zero">0 (beginning of clip)</option>
     <option value="random">random time</option>
     <option value="freeze">frozen (current frame)</option>
   </select>
   <div class="row inline">
-    <input type="number" id="ahead" value="5" step="0.5"> <span>seconds into the future</span>
+    <input type="number" id="ahead" value="5" step="0.5" min="0"> <span>seconds per section</span>
   </div>
 
   <label for="speed">Playback speed <span id="speedVal">1.00×</span></label>
@@ -144,6 +158,16 @@
   const showFrames = $('showFrames'), showTime = $('showTime'), showTimeline = $('showTimeline');
   const debugBox = $('debug'), soundBox = $('sound'), engineSelect = $('engine');
   const statusEl = $('status'), engineInfo = $('engineInfo'), fpsEl = $('fps');
+  const loaderEl = $('loader'), loaderText = $('loaderText'), loaderFill = $('loaderFill');
+
+  // top-center loading indicator; fraction null = indeterminate, text null = hide
+  function setLoader(text, fraction = null) {
+    if (text == null) { loaderEl.classList.add('done'); return; }
+    loaderText.textContent = text;
+    loaderEl.classList.toggle('indeterminate', fraction == null);
+    loaderFill.style.width = fraction == null ? '' : `${Math.round(fraction * 100)}%`;
+    loaderEl.classList.remove('done');
+  }
 
   let src = null;          // current video URL
   let base = null;         // base <video>: metadata, audio, and the clock in video mode
@@ -186,6 +210,7 @@
 
   function disposeVideo(v) {
     if (!v) return;
+    v.remove();
     v.pause();
     v.removeAttribute('src');
     v.load();
@@ -210,9 +235,11 @@
     }, { once: true });
     base.addEventListener('error', () => {
       statusEl.textContent = `Cannot play "${label}" in this browser (codec?).`;
+      setLoader(`cannot play ${label} in this browser`, 0);
     }, { once: true });
     if (playing) base.play().catch(() => {});
     statusEl.textContent = `loading ${label}…`;
+    setLoader(`loading ${label}…`);
   }
 
   // ---------- frame cache ----------
@@ -244,9 +271,25 @@
     });
   }
 
+  // Seek and wait until the new frame has actually been presented. 'seeked'
+  // alone can fire before the decoder delivers the frame, so grabbing then
+  // stores the previous picture again (a frozen run in the cache).
+  // Resolves with the presented frame's media time, or null if unknown.
   function seekTo(v, t) {
     return new Promise(resolve => {
-      v.addEventListener('seeked', resolve, { once: true });
+      let id = null, settled = false;
+      const fin = m => {
+        if (settled) return;
+        settled = true;
+        if (id != null) v.cancelVideoFrameCallback(id);
+        resolve(m);
+      };
+      if ('requestVideoFrameCallback' in v) {
+        id = v.requestVideoFrameCallback((_, meta) => { id = null; fin(meta.mediaTime); });
+        v.addEventListener('seeked', () => setTimeout(() => fin(null), 300), { once: true });
+      } else {
+        v.addEventListener('seeked', () => requestAnimationFrame(() => fin(null)), { once: true });
+      }
       v.currentTime = t;
     });
   }
@@ -260,7 +303,11 @@
     const d = duration(), vw = base.videoWidth, vh = base.videoHeight;
     if (!d || !vw) return;
 
+    setLoader('preparing frames…');
     const grab = makeVideo(src);
+    // frame callbacks only fire for a video that is in the page: add it, invisible
+    Object.assign(grab.style, { position: 'fixed', left: '0', top: '0', width: '2px', height: '2px', opacity: '0.01', zIndex: '-1', pointerEvents: 'none' });
+    document.body.appendChild(grab);
     await new Promise(r => grab.addEventListener('loadeddata', r, { once: true }));
     const fps = await measureFps(grab);
     if (token !== cacheToken) return disposeVideo(grab);
@@ -270,22 +317,35 @@
     if (mode === 'auto' && scale < AUTO_MIN_SCALE) {
       disposeVideo(grab);
       engineInfo.textContent = `clip too long for RAM cache (${n} frames) — one decoder per section`;
+      setLoader(null);
       return;
     }
     const w = Math.max(16, Math.round(vw * scale)), h = Math.max(9, Math.round(vh * scale));
     // keep a local handle: the user may switch video/engine while frames decode,
     // which drops `cache`; the token check stops this (now stale) build
-    const c = cache = { frames: new Array(n), fps, w, h, n, ready: false, done: 0 };
+    const c = cache = { frames: new Array(n), fps, w, h, n, ready: false, done: 0, retried: 0, wrong: 0 };
 
+    // decode starting at the base playhead and moving forward: the stretch right
+    // behind the playhead is cached first, so sections set in the past switch to
+    // cached frames within seconds (see sourceAt) instead of waiting for the end
     grab.pause();
-    for (let i = 0; i < n; i++) {
-      await seekTo(grab, Math.min(d - 1e-3, (i + 0.5) / fps));
+    const start = Math.floor(wrap(baseTime(), d) * fps) % n;
+    // is the presented frame (media time m) frame i? circular distance in frames
+    const isFrame = (m, i) => m == null || Math.abs(wrap(m * fps - i + n / 2, n) - n / 2) < 0.75;
+    for (let k = 0; k < n; k++) {
+      const i = (start + k) % n;
+      let m = await seekTo(grab, Math.min(d - 1e-3, (i + 0.5) / fps));
+      for (let tries = 0; !isFrame(m, i) && tries < 2 && token === cacheToken; tries++) {
+        c.retried++;
+        m = await seekTo(grab, Math.min(d - 1e-3, (i + 0.5 + 0.1 * (tries + 1)) / fps));
+      }
+      if (!isFrame(m, i)) c.wrong++;
       if (token !== cacheToken) return disposeVideo(grab);
       const bmp = await createImageBitmap(grab, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
       if (token !== cacheToken) { bmp.close(); return disposeVideo(grab); }
       c.frames[i] = bmp;
-      c.done = i + 1;
-      if (i % 5 === 0) updateEngineInfo();
+      c.done = k + 1;
+      if (k % 5 === 0) updateEngineInfo();
     }
     disposeVideo(grab);
     if (token !== cacheToken) return;
@@ -298,13 +358,15 @@
   }
 
   function updateEngineInfo() {
+    if (cache && !cache.ready) setLoader(`loading frames ${cache.done} / ${cache.n}`, cache.done / cache.n);
+    else setLoader(null);
     if (engineSelect.value === 'video' || !cache) {
       if (engineSelect.value === 'video') engineInfo.textContent = 'one video decoder per section';
       return;
     }
     const mb = Math.round(cache.n * cache.w * cache.h * 4 / 1e6);
     engineInfo.textContent = cache.ready
-      ? `RAM cache: ${cache.n} frames ${cache.w}×${cache.h} @ ${cache.fps.toFixed(2)} fps, ${mb} MB`
+      ? `RAM cache: ${cache.n} frames ${cache.w}×${cache.h} @ ${cache.fps.toFixed(2)} fps, ${mb} MB · re-grabbed ${cache.retried}, still wrong ${cache.wrong}`
       : `decoding frames into RAM… ${cache.done}/${cache.n} (using video decoders meanwhile)`;
   }
 
@@ -328,12 +390,13 @@
     if (!d) return;
     const now = baseTime(), mode = startMode.value;
     const s = { rect, color: nextColor(), frozen: false, offset: 0, time: 0, video: null };
-    if (mode === 'ahead') {
-      // each new section is N seconds ahead of the latest one (the first: ahead of base),
-      // so they stack up: +5, +10, +15 … (wrapped onto the clip length when played)
+    if (mode === 'behind' || mode === 'ahead') {
+      // each new section is N seconds behind (or ahead of) the latest one — the first
+      // relative to the base — so they stack up: −5, −10, −15 … (wrapped onto the clip)
       const last = sections[sections.length - 1];
       const lastOffset = !last ? 0 : last.frozen ? last.time - now : last.offset;
-      s.offset = lastOffset + (parseFloat(aheadInput.value) || 0);
+      const step = Math.abs(parseFloat(aheadInput.value) || 0);
+      s.offset = lastOffset + (mode === 'behind' ? -step : step);
     }
     else if (mode === 'zero') s.offset = -now;
     else if (mode === 'random') s.offset = Math.random() * d;
@@ -359,6 +422,10 @@
   function syncSectionVideos() {
     const d = duration();
     for (const s of sections) {
+      if (cachedFrame(sectionTime(s))) {          // served from the cache: no decoder needed
+        if (s.video && !s.video.paused) s.video.pause();
+        continue;
+      }
       if (!s.video) {
         s.video = makeVideo(src);
         s.video.addEventListener('loadedmetadata', () => { s.video && (s.video.currentTime = sectionTime(s)); }, { once: true });
@@ -502,11 +569,13 @@
   }
 
   // frame source for a time: [image, width, height] or null
+  // frame source for a time: a cached frame if it is decoded already (also while
+  // the cache is still filling), else the video element
+  const cachedFrame = t => cache && cache.frames[Math.min(cache.n - 1, Math.floor(t * cache.fps))];
   function sourceAt(t, video) {
-    if (cacheMode()) {
-      const f = cache.frames[Math.min(cache.n - 1, Math.floor(t * cache.fps))];
-      return f ? [f, cache.w, cache.h] : null;
-    }
+    const f = cachedFrame(t);
+    if (f) return [f, cache.w, cache.h];
+    if (cacheMode()) return null;
     return video && video.readyState >= 2 ? [video, video.videoWidth, video.videoHeight] : null;
   }
 
