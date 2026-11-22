@@ -1,0 +1,5 @@
+# source / unused videos — kept locally, not published or listed in the app
+videos/not used/
+
+.DS_Store
+.claude/

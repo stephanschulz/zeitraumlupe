@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zeitraumlupe</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 13px/1.4 -apple-system, system-ui, sans-serif; color: #ddd; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #gui {
+    position: fixed; top: 12px; left: 12px; width: 260px; padding: 12px 14px;
+    background: rgba(20,20,20,.82); border: 1px solid #333; border-radius: 8px;
+    backdrop-filter: blur(6px); user-select: none;
+  }
+  /* collapse by shrinking the body's grid row to 0 while fading it out */
+  #guiBody { display: grid; grid-template-rows: 1fr; opacity: 1;
+             transition: grid-template-rows .35s ease, opacity .25s ease; }
+  #guiBody > .inner { overflow: hidden; min-height: 0; }
+  #gui h1 { transition: margin .35s ease; }
+  #gui.collapsed #guiBody { grid-template-rows: 0fr; opacity: 0; pointer-events: none; }
+  #gui.collapsed h1 { margin: 0; }
+  /* the automatic collapse after page load is slower and softer */
+  #gui.slow #guiBody { transition: grid-template-rows 2.5s ease-in-out, opacity 1.8s ease-in-out; }
+  #gui.slow h1 { transition: margin 2.5s ease-in-out; }
+  #gui h1 { font-size: 14px; margin: 0 0 8px; font-weight: 600; letter-spacing: .04em; display: flex; justify-content: space-between; align-items: center; gap: 8px; cursor: pointer; }
+  #gui h1 .arrow { display: inline-block; width: 12px; color: #888; transition: transform .15s; }
+  #gui.collapsed h1 .arrow { transform: rotate(-90deg); }
+  #gui h1 .title { flex: 1; }
+  #fps { font: 11px ui-monospace, Menlo, monospace; color: #8f8; font-weight: normal; }
+  #gui label { display: block; margin: 8px 0 3px; color: #999; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  #gui select, #gui button, #gui input[type=range] { width: 100%; box-sizing: border-box; }
+  #gui select, #gui button { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 5px 6px; font: inherit; }
+  #gui button { cursor: pointer; }
+  #gui button:hover { background: #363636; }
+  #gui .row { display: flex; gap: 6px; margin-top: 6px; }
+  #gui .row > * { flex: 1; }
+  #gui .check { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: #ccc; text-transform: none; font-size: 13px; letter-spacing: 0; }
+  #gui .check input { margin: 0; }
+  #gui .sub { padding-left: 18px; }
+  #gui .row.inline { align-items: center; color: #aaa; }
+  #gui .row.inline input { flex: 0 0 56px; background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 5px; font: inherit; }
+  #gui .row.inline span { flex: 1; }
+  #status, #engineInfo { margin-top: 6px; color: #888; font-size: 11px; }
+  #help { margin-top: 8px; color: #666; font-size: 11px; }
+  .hiddenInput { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="gui">
+  <h1 id="guiBar" title="click or press g to minimize / maximize"><span class="arrow">▾</span><span class="title">ZEITRAUMLUPE</span><span id="fps"></span></h1>
+  <div id="guiBody"><div class="inner">
+  <div class="row" style="margin-top:0">
+    <button id="playBtn">Pause</button>
+    <button id="randomBtn" title="add 10 random sections (r)">Random</button>
+    <button id="undoBtn">Undo</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+
+  <label for="videoSelect">Video</label>
+  <select id="videoSelect"></select>
+  <div class="row">
+    <button id="openBtn">Open other video…</button>
+  </div>
+  <input type="file" id="file" class="hiddenInput" accept="video/*,.mov,.mp4,.m4v,.webm">
+
+  <label for="startMode">New section starts at</label>
+  <select id="startMode">
+    <option value="ahead" selected>ahead of latest section</option>
+    <option value="zero">0 (beginning of clip)</option>
+    <option value="random">random time</option>
+    <option value="freeze">frozen (current frame)</option>
+  </select>
+  <div class="row inline">
+    <input type="number" id="ahead" value="5" step="0.5"> <span>seconds into the future</span>
+  </div>
+
+  <label for="speed">Playback speed <span id="speedVal">1.00×</span></label>
+  <input type="range" id="speed" min="0.1" max="2" step="0.05" value="1">
+
+
+  <label>Design</label>
+  <div class="row">
+    <button id="saveBtn">Save design</button>
+    <button id="loadBtn">Load design…</button>
+  </div>
+  <input type="file" id="designFile" class="hiddenInput" accept=".json,application/json">
+
+  <label for="engine">Playback engine</label>
+  <select id="engine">
+    <option value="auto" selected>auto</option>
+    <option value="cache">frame cache in RAM (fast)</option>
+    <option value="video">one video decoder per section</option>
+  </select>
+  <div id="engineInfo"></div>
+
+  <label class="check"><input type="checkbox" id="debug"> debug mode (d)</label>
+  <div class="sub">
+    <label class="check"><input type="checkbox" id="showFrames"> colored section frames</label>
+    <label class="check"><input type="checkbox" id="showTime"> time code per section</label>
+    <label class="check"><input type="checkbox" id="showTimeline"> timeline with playheads</label>
+  </div>
+  <label class="check"><input type="checkbox" id="sound"> sound (base video)</label>
+
+  <div id="status"></div>
+  <div id="help">
+    drag: open a section · right-click: remove section<br>
+    g: minimize/maximize gui · d: debug · space: play/pause · r: random · z: undo · c: clear · f: fullscreen · s: save design
+  </div>
+  </div></div>
+</div>
+
+<script>
+(() => {
+  // ======================================================================
+  // Model: the base video runs on one clock (baseT). Every section is pure
+  // data — a rectangle plus an offset in seconds relative to that clock
+  // (or a fixed time when frozen). Its time is wrap(baseT + offset).
+  //
+  // Rendering: by default the whole clip is decoded ONCE into a RAM frame
+  // cache, and every section just picks its frame from it — so the number
+  // of sections costs almost nothing. Clips too long for the memory budget
+  // fall back to one <video> decoder per section, kept in sync with the
+  // model.
+  // ======================================================================
+  const VIDEO_DIR = 'videos/';
+  const VIDEO_EXT = /\.(mov|mp4|m4v|webm|ogv|mkv)$/i;
+  const MIN_DRAG_PX = 6;
+  const GUI_AUTOHIDE_S = 10;                   // GUI collapses this long after the page opens
+  const DEFAULT_VIDEO_PREFIX = 'people_720';   // selected on start if present
+  const RANDOM_COUNT = 10;                     // sections added by the Random button
+  const RANDOM_MIN = 0.12, RANDOM_MAX = 0.4;   // their width/height as a fraction of the frame
+  const CACHE_BUDGET_MB = 1200;     // max RAM for the decoded frame cache
+  const AUTO_MIN_SCALE = 0.5;       // auto: use cache only if frames keep ≥ 50% resolution
+  const RESYNC_S = 0.25;            // video engine: re-seek a section if it drifts this far
+  const BASE_COLOR = '#ffffff';
+
+  const $ = id => document.getElementById(id);
+  const canvas = $('c'), ctx = canvas.getContext('2d');
+  const gui = $('gui'), videoSelect = $('videoSelect'), fileInput = $('file');
+  const startMode = $('startMode'), aheadInput = $('ahead');
+  const speedInput = $('speed'), speedVal = $('speedVal'), playBtn = $('playBtn');
+  const showFrames = $('showFrames'), showTime = $('showTime'), showTimeline = $('showTimeline');
+  const debugBox = $('debug'), soundBox = $('sound'), engineSelect = $('engine');
+  const statusEl = $('status'), engineInfo = $('engineInfo'), fpsEl = $('fps');
+
+  let src = null;          // current video URL
+  let base = null;         // base <video>: metadata, audio, and the clock in video mode
+  let sections = [];       // { rect:{x,y,w,h} normalized, color, frozen, offset, time, video? }
+  let playing = true;
+  let clock = 0;           // base time in seconds (cache mode)
+  let drag = null;
+  let objectUrl = null;
+  let colorIndex = 0;
+  let cache = null;        // { frames: ImageBitmap[], fps, w, h, ready, token }
+  let cacheToken = 0;
+
+  const dpr = () => window.devicePixelRatio || 1;
+  const wrap = (t, d) => ((t % d) + d) % d;
+  const speed = () => parseFloat(speedInput.value);
+  const duration = () => (base && isFinite(base.duration) && base.duration > 0) ? base.duration : 0;
+  // golden-angle hue steps give well separated colors for any number of sections
+  const nextColor = () => `hsl(${(colorIndex++ * 137.508 + 10) % 360}, 90%, 60%)`;
+  const cacheMode = () => !!(cache && cache.ready);
+
+  // ---------- time ----------
+  const baseTime = () => cacheMode() ? clock : (base ? base.currentTime : 0);
+  function sectionTime(s) {
+    const d = duration();
+    if (!d) return 0;
+    return s.frozen ? wrap(s.time, d) : wrap(baseTime() + s.offset, d);
+  }
+
+  // ---------- video elements ----------
+  function makeVideo(url) {
+    const v = document.createElement('video');
+    v.src = url;
+    v.loop = true;
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.playbackRate = speed();
+    return v;
+  }
+
+  function disposeVideo(v) {
+    if (!v) return;
+    v.pause();
+    v.removeAttribute('src');
+    v.load();
+  }
+
+  function dropSectionVideos() {
+    sections.forEach(s => { disposeVideo(s.video); s.video = null; });
+  }
+
+  function loadVideo(url, label) {
+    clearSections();
+    dropCache();
+    disposeVideo(base);
+    src = url;
+    clock = 0;
+    base = makeVideo(url);
+    base.muted = !soundBox.checked;
+    base.addEventListener('loadedmetadata', () => {
+      resize();
+      setStatus();
+      buildCache();
+    }, { once: true });
+    base.addEventListener('error', () => {
+      statusEl.textContent = `Cannot play "${label}" in this browser (codec?).`;
+    }, { once: true });
+    if (playing) base.play().catch(() => {});
+    statusEl.textContent = `loading ${label}…`;
+  }
+
+  // ---------- frame cache ----------
+  function dropCache() {
+    cacheToken++;
+    if (cache) cache.frames.forEach(f => f && f.close && f.close());
+    cache = null;
+  }
+
+  // measure the clip's frame rate from presented frames; fall back to 30
+  function measureFps(v) {
+    return new Promise(resolve => {
+      if (!('requestVideoFrameCallback' in v)) return resolve(30);
+      const times = [];
+      const done = () => {
+        v.pause();
+        const d = times.slice(1).map((t, i) => t - times[i]).filter(x => x > 0.005).sort((a, b) => a - b);
+        const fps = d.length ? 1 / d[Math.floor(d.length / 2)] : 30;
+        resolve(fps > 5 && fps < 121 ? fps : 30);
+      };
+      const timer = setTimeout(done, 1500);
+      const cb = (_, meta) => {
+        times.push(meta.mediaTime);
+        if (times.length >= 10) { clearTimeout(timer); done(); }
+        else v.requestVideoFrameCallback(cb);
+      };
+      v.requestVideoFrameCallback(cb);
+      v.play().catch(() => { clearTimeout(timer); resolve(30); });
+    });
+  }
+
+  function seekTo(v, t) {
+    return new Promise(resolve => {
+      v.addEventListener('seeked', resolve, { once: true });
+      v.currentTime = t;
+    });
+  }
+
+  async function buildCache() {
+    dropCache();
+    syncBaseVideo();                // base video drives the clock again until the cache is ready
+    const mode = engineSelect.value;
+    if (mode === 'video') { updateEngineInfo(); return; }
+    const token = cacheToken;
+    const d = duration(), vw = base.videoWidth, vh = base.videoHeight;
+    if (!d || !vw) return;
+
+    const grab = makeVideo(src);
+    await new Promise(r => grab.addEventListener('loadeddata', r, { once: true }));
+    const fps = await measureFps(grab);
+    if (token !== cacheToken) return disposeVideo(grab);
+
+    const n = Math.max(1, Math.round(d * fps));
+    const scale = Math.min(1, Math.sqrt(CACHE_BUDGET_MB * 1e6 / (n * vw * vh * 4)));
+    if (mode === 'auto' && scale < AUTO_MIN_SCALE) {
+      disposeVideo(grab);
+      engineInfo.textContent = `clip too long for RAM cache (${n} frames) — one decoder per section`;
+      return;
+    }
+    const w = Math.max(16, Math.round(vw * scale)), h = Math.max(9, Math.round(vh * scale));
+    // keep a local handle: the user may switch video/engine while frames decode,
+    // which drops `cache`; the token check stops this (now stale) build
+    const c = cache = { frames: new Array(n), fps, w, h, n, ready: false, done: 0 };
+
+    grab.pause();
+    for (let i = 0; i < n; i++) {
+      await seekTo(grab, Math.min(d - 1e-3, (i + 0.5) / fps));
+      if (token !== cacheToken) return disposeVideo(grab);
+      const bmp = await createImageBitmap(grab, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
+      if (token !== cacheToken) { bmp.close(); return disposeVideo(grab); }
+      c.frames[i] = bmp;
+      c.done = i + 1;
+      if (i % 5 === 0) updateEngineInfo();
+    }
+    disposeVideo(grab);
+    if (token !== cacheToken) return;
+
+    clock = base.currentTime;       // hand the clock over without a jump
+    c.ready = true;
+    dropSectionVideos();
+    syncBaseVideo();
+    updateEngineInfo();
+  }
+
+  function updateEngineInfo() {
+    if (engineSelect.value === 'video' || !cache) {
+      if (engineSelect.value === 'video') engineInfo.textContent = 'one video decoder per section';
+      return;
+    }
+    const mb = Math.round(cache.n * cache.w * cache.h * 4 / 1e6);
+    engineInfo.textContent = cache.ready
+      ? `RAM cache: ${cache.n} frames ${cache.w}×${cache.h} @ ${cache.fps.toFixed(2)} fps, ${mb} MB`
+      : `decoding frames into RAM… ${cache.done}/${cache.n} (using video decoders meanwhile)`;
+  }
+
+  // In cache mode the base <video> only provides sound; it is paused when muted.
+  function syncBaseVideo() {
+    if (!base) return;
+    base.muted = !soundBox.checked;
+    base.playbackRate = speed();
+    const needed = playing && (!cacheMode() || soundBox.checked);
+    if (needed) {
+      if (cacheMode()) base.currentTime = clock;
+      base.play().catch(() => {});
+    } else {
+      base.pause();
+    }
+  }
+
+  // ---------- sections ----------
+  function addSection(rect) {
+    const d = duration();
+    if (!d) return;
+    const now = baseTime(), mode = startMode.value;
+    const s = { rect, color: nextColor(), frozen: false, offset: 0, time: 0, video: null };
+    if (mode === 'ahead') {
+      // each new section is N seconds ahead of the latest one (the first: ahead of base),
+      // so they stack up: +5, +10, +15 … (wrapped onto the clip length when played)
+      const last = sections[sections.length - 1];
+      const lastOffset = !last ? 0 : last.frozen ? last.time - now : last.offset;
+      s.offset = lastOffset + (parseFloat(aheadInput.value) || 0);
+    }
+    else if (mode === 'zero') s.offset = -now;
+    else if (mode === 'random') s.offset = Math.random() * d;
+    else { s.frozen = true; s.time = now; }
+    sections.push(s);
+    setStatus();
+  }
+
+  function removeSection(i) {
+    disposeVideo(sections[i].video);
+    sections.splice(i, 1);
+    setStatus();
+  }
+
+  function clearSections() {
+    dropSectionVideos();
+    sections = [];
+    colorIndex = 0;
+    setStatus();
+  }
+
+  // video engine: give each section its own decoder and keep it on the model time
+  function syncSectionVideos() {
+    const d = duration();
+    for (const s of sections) {
+      if (!s.video) {
+        s.video = makeVideo(src);
+        s.video.addEventListener('loadedmetadata', () => { s.video && (s.video.currentTime = sectionTime(s)); }, { once: true });
+      }
+      const v = s.video;
+      if (v.readyState < 1) continue;
+      const shouldPlay = playing && !s.frozen;
+      if (shouldPlay && v.paused) v.play().catch(() => {});
+      if (!shouldPlay && !v.paused) v.pause();
+      if (v.playbackRate !== speed()) v.playbackRate = speed();
+      const diff = wrap(v.currentTime - sectionTime(s) + d / 2, d) - d / 2;
+      if (Math.abs(diff) > (s.frozen || !playing ? 0.02 : RESYNC_S) && !v.seeking) v.currentTime = sectionTime(s);
+    }
+  }
+
+  // ---------- save / load designs ----------
+  const currentVideoName = () => (videoSelect.selectedOptions[0]?.textContent || '').replace(/ \(local\)$/, '');
+  const r4 = n => Math.round(n * 1e4) / 1e4;
+
+  function saveDesign() {
+    if (!base) return;
+    const design = {
+      app: 'zeitraumlupe', version: 1,
+      video: currentVideoName(),
+      speed: speed(),
+      sections: sections.map(s => ({
+        rect: { x: r4(s.rect.x), y: r4(s.rect.y), w: r4(s.rect.w), h: r4(s.rect.h) },
+        color: s.color,
+        ...(s.frozen ? { frozen: true, time: r4(sectionTime(s)) } : { offset: r4(s.offset) }),
+      })),
+    };
+    const blob = new Blob([JSON.stringify(design, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const stem = design.video.replace(/\.[^.]+$/, '').replace(/[^\w+-]+/g, '_');
+    a.download = `zeitraumlupe-${stem}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  function applyDesign(design) {
+    if (!design || !Array.isArray(design.sections)) throw new Error('not a Zeitraumlupe design');
+    const opt = [...videoSelect.options].find(o => o.textContent.replace(/ \(local\)$/, '') === design.video);
+    if (opt && opt.value !== src) {
+      videoSelect.value = opt.value;
+      loadVideo(opt.value, opt.textContent);
+    } else {
+      clearSections();
+    }
+    if (design.speed) { speedInput.value = design.speed; onSpeed(); }
+    for (const d of design.sections) {
+      sections.push({
+        rect: d.rect, color: d.color || nextColor(), video: null,
+        frozen: !!d.frozen, time: d.time || 0, offset: d.offset || 0,
+      });
+      if (d.color) colorIndex++;
+    }
+    setStatus();
+    if (!opt) setTimeout(() => { statusEl.textContent = `video "${design.video}" not found — design applied to current video`; }, 0);
+  }
+
+  async function loadDesignFile(f) {
+    try { applyDesign(JSON.parse(await f.text())); }
+    catch (err) { statusEl.textContent = 'could not load design: ' + err.message; }
+  }
+
+  // ---------- layout: video is letterboxed into the canvas ----------
+  const view = { x: 0, y: 0, w: 1, h: 1 };
+
+  function resize() {
+    canvas.width = Math.round(innerWidth * dpr());
+    canvas.height = Math.round(innerHeight * dpr());
+    const vw = base && base.videoWidth || 16, vh = base && base.videoHeight || 9;
+    const s = Math.min(canvas.width / vw, canvas.height / vh);
+    view.w = vw * s; view.h = vh * s;
+    view.x = (canvas.width - view.w) / 2;
+    view.y = (canvas.height - view.h) / 2;
+  }
+
+  const toCanvasPx = e => ({ x: e.clientX * dpr(), y: e.clientY * dpr() });
+  const toNorm = p => ({
+    x: Math.min(1, Math.max(0, (p.x - view.x) / view.w)),
+    y: Math.min(1, Math.max(0, (p.y - view.y) / view.h)),
+  });
+
+  // ---------- drawing ----------
+  function fmt(t) {
+    if (!isFinite(t)) return '--';
+    const m = Math.floor(t / 60), s = t - m * 60;
+    return `${m}:${s.toFixed(2).padStart(5, '0')}`;
+  }
+
+  function drawLabel(text, x, y, color) {
+    const k = dpr();
+    ctx.font = `${11 * k}px ui-monospace, Menlo, monospace`;
+    const pad = 3 * k, w = ctx.measureText(text).width + pad * 2, h = 15 * k;
+    ctx.fillStyle = 'rgba(0,0,0,.65)';
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = color;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + pad, y + h / 2);
+  }
+
+  // Overall timeline along the bottom: one playhead per time stream,
+  // white for the base video, the section's frame color for each section.
+  function drawTimeline() {
+    const k = dpr(), dur = duration();
+    if (!dur) return;
+    const m = 20 * k, h = 34 * k;
+    const x0 = m, x1 = canvas.width - m, y0 = canvas.height - m - h;
+    const tx = t => x0 + (Math.min(Math.max(t, 0), dur) / dur) * (x1 - x0);
+
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(x0 - 8 * k, y0 - 6 * k, x1 - x0 + 16 * k, h + 12 * k);
+
+    const trackY = y0 + h * 0.55;
+    ctx.fillStyle = 'rgba(255,255,255,.25)';
+    ctx.fillRect(x0, trackY - k, x1 - x0, 2 * k);
+    ctx.font = `${9 * k}px ui-monospace, Menlo, monospace`;
+    ctx.textBaseline = 'top';
+    const step = dur > 120 ? 30 : dur > 30 ? 5 : dur > 8 ? 1 : 0.5;
+    for (let t = 0; t <= dur + 1e-6; t += step) {
+      const x = tx(t);
+      ctx.fillStyle = 'rgba(255,255,255,.35)';
+      ctx.fillRect(x, trackY + 3 * k, k, 4 * k);
+      ctx.fillText(t.toFixed(step < 1 ? 1 : 0), x + 2 * k, trackY + 6 * k);
+    }
+
+    const heads = [{ t: baseTime(), color: BASE_COLOR, w: 3 }, ...sections.map(s => ({ t: sectionTime(s), color: s.color, w: 2 }))];
+    for (const hd of heads) {
+      const x = tx(hd.t);
+      ctx.fillStyle = hd.color;
+      ctx.fillRect(x - hd.w * k / 2, y0, hd.w * k, h * 0.6);
+      ctx.beginPath();
+      ctx.moveTo(x - 4 * k, y0);
+      ctx.lineTo(x + 4 * k, y0);
+      ctx.lineTo(x, y0 + 6 * k);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // frame source for a time: [image, width, height] or null
+  function sourceAt(t, video) {
+    if (cacheMode()) {
+      const f = cache.frames[Math.min(cache.n - 1, Math.floor(t * cache.fps))];
+      return f ? [f, cache.w, cache.h] : null;
+    }
+    return video && video.readyState >= 2 ? [video, video.videoWidth, video.videoHeight] : null;
+  }
+
+  // fps meter
+  let lastT = performance.now(), fpsAcc = 0, fpsFrames = 0, fpsShown = 0;
+
+  function render(now) {
+    requestAnimationFrame(render);
+    const dt = Math.min(0.1, (now - lastT) / 1000);
+    lastT = now;
+    fpsAcc += dt; fpsFrames++;
+    if (fpsAcc >= 0.5) {
+      fpsShown = fpsFrames / fpsAcc;
+      fpsEl.textContent = `${fpsShown.toFixed(0)} fps`;
+      fpsEl.style.color = fpsShown > 50 ? '#8f8' : fpsShown > 25 ? '#fd6' : '#f66';
+      fpsAcc = 0; fpsFrames = 0;
+    }
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (!base || base.readyState < 2) return;
+    const d = duration();
+
+    // advance the clock; with sound on, the audible base video is the master
+    if (cacheMode()) {
+      if (playing && soundBox.checked && !base.paused) clock = base.currentTime;
+      else if (playing) clock = wrap(clock + dt * speed(), d);
+    } else {
+      syncSectionVideos();
+    }
+
+    const b = sourceAt(baseTime(), base);
+    if (b) ctx.drawImage(b[0], view.x, view.y, view.w, view.h);
+
+    for (const s of sections) {
+      const fr = sourceAt(sectionTime(s), s.video);
+      if (!fr) continue;
+      const [img, iw, ih] = fr, r = s.rect;
+      ctx.drawImage(img, r.x * iw, r.y * ih, Math.max(1, r.w * iw), Math.max(1, r.h * ih),
+        view.x + r.x * view.w, view.y + r.y * view.h, r.w * view.w, r.h * view.h);
+    }
+
+    const k = dpr();
+    if (showTime.checked) drawLabel(fmt(baseTime()), view.x + 6 * k, view.y + 6 * k, BASE_COLOR);
+    for (const s of sections) {
+      const r = s.rect, x = view.x + r.x * view.w, y = view.y + r.y * view.h;
+      if (showFrames.checked) {
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 2 * k;
+        ctx.strokeRect(x, y, r.w * view.w, r.h * view.h);
+      }
+      if (showTime.checked) drawLabel(fmt(sectionTime(s)) + (s.frozen ? ' ■' : ''), x + 3 * k, y + 3 * k, s.color);
+    }
+
+    if (showTimeline.checked) drawTimeline();
+
+    if (drag) {
+      ctx.strokeStyle = '#ff0';
+      ctx.lineWidth = k;
+      ctx.setLineDash([4 * k, 4 * k]);
+      ctx.strokeRect(drag.x0, drag.y0, drag.x1 - drag.x0, drag.y1 - drag.y0);
+      ctx.setLineDash([]);
+    }
+  }
+
+  // ---------- mouse ----------
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || !base) return;
+    canvas.setPointerCapture(e.pointerId);
+    const p = toCanvasPx(e);
+    drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const p = toCanvasPx(e);
+    drag.x1 = p.x; drag.y1 = p.y;
+  });
+
+  canvas.addEventListener('pointerup', () => {
+    if (!drag) return;
+    const dd = drag; drag = null;
+    const min = MIN_DRAG_PX * dpr();
+    if (Math.abs(dd.x1 - dd.x0) < min || Math.abs(dd.y1 - dd.y0) < min) return;
+    const a = toNorm({ x: Math.min(dd.x0, dd.x1), y: Math.min(dd.y0, dd.y1) });
+    const b = toNorm({ x: Math.max(dd.x0, dd.x1), y: Math.max(dd.y0, dd.y1) });
+    if (b.x - a.x <= 0 || b.y - a.y <= 0) return;
+    addSection({ x: a.x, y: a.y, w: b.x - a.x, h: b.y - a.y });
+  });
+
+  canvas.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    const n = toNorm(toCanvasPx(e));
+    for (let i = sections.length - 1; i >= 0; i--) {   // topmost first
+      const r = sections[i].rect;
+      if (n.x >= r.x && n.x <= r.x + r.w && n.y >= r.y && n.y <= r.y + r.h) { removeSection(i); return; }
+    }
+  });
+
+  // ---------- controls ----------
+  function setPlaying(p) {
+    playing = p;
+    playBtn.textContent = p ? 'Pause' : 'Play';
+    syncBaseVideo();
+  }
+
+  function setStatus() {
+    if (!base) return;
+    const dims = base.videoWidth ? `${base.videoWidth}×${base.videoHeight}, ${base.duration.toFixed(2)}s` : '';
+    statusEl.textContent = `${currentVideoName()} ${dims} · ${sections.length} section${sections.length === 1 ? '' : 's'}`;
+  }
+
+  function onSpeed() {
+    speedVal.textContent = speed().toFixed(2) + '×';
+    if (base) base.playbackRate = speed();
+  }
+
+  // debug mode switches frames, time codes and timeline together;
+  // each can still be toggled on its own afterwards
+  function setDebug(on) {
+    debugBox.checked = on;
+    showFrames.checked = showTime.checked = showTimeline.checked = on;
+  }
+
+  // the GUI shows on start so people know it exists, then folds away after
+  // GUI_AUTOHIDE_S — unless the user already toggled it or is using it right now
+  let guiTouched = false;
+  const toggleGui = () => { guiTouched = true; gui.classList.remove('slow'); gui.classList.toggle('collapsed'); };
+  $('guiBar').onclick = toggleGui;
+  setTimeout(function autoCollapse() {
+    if (guiTouched) return;
+    if (gui.matches(':hover')) {
+      gui.addEventListener('mouseleave', () => setTimeout(autoCollapse, 1500), { once: true });
+      return;
+    }
+    gui.classList.add('slow', 'collapsed');
+  }, GUI_AUTOHIDE_S * 1000);
+  playBtn.onclick = () => setPlaying(!playing);
+  // add RANDOM_COUNT sections at random places, never smaller than RANDOM_MIN of the frame
+  function addRandomSections() {
+    if (!duration()) return;
+    const rnd = (a, b) => a + Math.random() * (b - a);
+    for (let i = 0; i < RANDOM_COUNT; i++) {
+      const w = rnd(RANDOM_MIN, RANDOM_MAX), h = rnd(RANDOM_MIN, RANDOM_MAX);
+      addSection({ x: rnd(0, 1 - w), y: rnd(0, 1 - h), w, h });
+    }
+  }
+  $('randomBtn').onclick = addRandomSections;
+  $('undoBtn').onclick = () => sections.length && removeSection(sections.length - 1);
+  $('clearBtn').onclick = clearSections;
+  $('openBtn').onclick = () => fileInput.click();
+  $('saveBtn').onclick = saveDesign;
+  $('loadBtn').onclick = () => $('designFile').click();
+  $('designFile').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) loadDesignFile(f); };
+  speedInput.oninput = onSpeed;
+  soundBox.onchange = syncBaseVideo;
+  debugBox.onchange = () => setDebug(debugBox.checked);
+  engineSelect.onchange = () => { if (base && base.readyState >= 1) { dropSectionVideos(); buildCache(); } };
+
+  videoSelect.onchange = () => {
+    const opt = videoSelect.selectedOptions[0];
+    loadVideo(opt.value, opt.textContent);
+  };
+
+  function openLocalFile(f) {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = URL.createObjectURL(f);
+    let opt = videoSelect.querySelector('option[data-local]');
+    if (!opt) {
+      opt = document.createElement('option');
+      opt.dataset.local = '1';
+      videoSelect.appendChild(opt);
+    }
+    opt.value = objectUrl;
+    opt.textContent = f.name + ' (local)';
+    videoSelect.value = objectUrl;
+    loadVideo(objectUrl, f.name);
+  }
+
+  fileInput.onchange = () => {
+    const f = fileInput.files[0];
+    fileInput.value = '';
+    if (f) openLocalFile(f);
+  };
+
+  // drop a video to open it, or a .json design to load it
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    if (/\.json$/i.test(f.name)) loadDesignFile(f);
+    else if (f.type.startsWith('video/') || VIDEO_EXT.test(f.name)) openLocalFile(f);
+  });
+
+  window.addEventListener('keydown', e => {
+    const inField = e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT';
+    if (inField && (e.target.type === 'number' || !'gGdD'.includes(e.key))) return;
+    switch (e.key) {
+      case 'g': case 'G': toggleGui(); break;
+      case 'd': case 'D': setDebug(!debugBox.checked); break;
+      case 's': case 'S': saveDesign(); break;
+      case ' ': e.preventDefault(); setPlaying(!playing); break;
+      case 'z': case 'Z': case 'Backspace': if (sections.length) removeSection(sections.length - 1); break;
+      case 'c': case 'C': clearSections(); break;
+      case 'r': case 'R': addRandomSections(); break;
+      case 'f': case 'F':
+        document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+        break;
+    }
+  });
+
+  window.addEventListener('resize', resize);
+
+  // ---------- video folder listing ----------
+  // 1. the directory index a local web server makes for videos/
+  //    (python3 -m http.server) — only files directly in videos/, so
+  //    sub-folders like "videos/not used/" never show up;
+  // 2. otherwise videos/index.json (array of filenames), needed on hosts
+  //    without directory listings such as GitHub Pages — see make_index.sh.
+  async function listVideos() {
+    try {
+      const r = await fetch(VIDEO_DIR, { cache: 'no-store' });
+      const html = r.ok ? await r.text() : '';
+      if (/<a\s/i.test(html)) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const names = [...doc.querySelectorAll('a[href]')]
+          .map(a => decodeURIComponent(a.getAttribute('href').split(/[?#]/)[0]))
+          .filter(n => !n.includes('/') && VIDEO_EXT.test(n));
+        if (names.length) return [...new Set(names)].sort((a, b) => a.localeCompare(b));
+      }
+    } catch (_) {}
+    try {
+      const r = await fetch(VIDEO_DIR + 'index.json', { cache: 'no-store' });
+      if (r.ok) return (await r.json()).filter(n => !n.includes('/') && VIDEO_EXT.test(n));
+    } catch (_) {}
+    return [];
+  }
+
+  async function init() {
+    resize();
+    requestAnimationFrame(render);
+    for (const n of await listVideos()) {
+      const opt = document.createElement('option');
+      opt.value = VIDEO_DIR + encodeURIComponent(n);
+      opt.textContent = n;
+      videoSelect.appendChild(opt);
+    }
+    const preferred = [...videoSelect.options].find(o => o.textContent.startsWith(DEFAULT_VIDEO_PREFIX)) || videoSelect.options[0];
+    if (preferred) {
+      videoSelect.value = preferred.value;
+      loadVideo(preferred.value, preferred.textContent);
+    } else {
+      statusEl.textContent = 'No videos found in videos/ — use "Open other video…" or drop a file.';
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
